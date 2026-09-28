@@ -1,0 +1,26 @@
+[Unit]
+Description=WeChat Converter API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=converter
+Group=converter
+WorkingDirectory=/opt/wechat-converter-api
+EnvironmentFile=-/opt/wechat-converter-api/.env
+Environment=HOME=/var/lib/wechat-converter
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/wechat-converter-api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 18080 --workers 1
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/wechat-converter
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
