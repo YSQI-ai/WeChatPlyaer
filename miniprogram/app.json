@@ -1,0 +1,13 @@
+{
+  "pages": [
+    "pages/index/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "文件转换",
+    "navigationBarBackgroundColor": "#f4f6f3",
+    "navigationBarTextStyle": "black",
+    "backgroundColor": "#f4f6f3"
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}

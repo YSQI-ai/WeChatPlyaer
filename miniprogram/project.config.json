@@ -1,0 +1,14 @@
+{
+  "description": "WeChat file conversion mini program",
+  "miniprogramRoot": "./",
+  "compileType": "miniprogram",
+  "setting": {
+    "urlCheck": true,
+    "es6": true,
+    "enhance": true,
+    "postcss": true,
+    "minified": true
+  },
+  "appid": "wxffba3ec2042cf72d",
+  "projectname": "wechat-converter"
+}

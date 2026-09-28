@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
+from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Callable
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 
@@ -23,6 +28,7 @@ CHUNK_SIZE = 1024 * 1024
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(512 * 1024 * 1024)))
 CONVERSION_TIMEOUT_SECONDS = int(os.getenv("CONVERSION_TIMEOUT_SECONDS", "600"))
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+DOWNLOAD_LINK_TTL_SECONDS = int(os.getenv("DOWNLOAD_LINK_TTL_SECONDS", "900"))
 TMP_ROOT = Path(os.getenv("CONVERTER_TMP_ROOT", "/var/lib/wechat-converter/tmp"))
 LIBREOFFICE_BIN = os.getenv("LIBREOFFICE_BIN", "libreoffice")
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
@@ -159,11 +165,62 @@ def _extension(filename: str | None) -> str:
 
 def _new_job_dir() -> Path:
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    _cleanup_expired_downloads()
     return Path(tempfile.mkdtemp(prefix="job-", dir=TMP_ROOT))
 
 
 def _remove_job_dir(job_dir: str | Path) -> None:
     shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _cleanup_expired_downloads() -> None:
+    if not TMP_ROOT.exists():
+        return
+    expiration_time = time.time() - DOWNLOAD_LINK_TTL_SECONDS
+    for download_dir in TMP_ROOT.glob("download-*"):
+        try:
+            if download_dir.is_dir() and download_dir.stat().st_mtime < expiration_time:
+                _remove_job_dir(download_dir)
+        except OSError:
+            logger.warning("Could not inspect temporary download %s", download_dir)
+
+
+def _store_download(output_path: Path, job_dir: Path, download_name: str) -> str:
+    token = secrets.token_urlsafe(32)
+    download_dir = TMP_ROOT / f"download-{token}"
+    download_dir.mkdir(mode=0o700)
+    try:
+        output_path.replace(download_dir / download_name)
+    except Exception:
+        _remove_job_dir(download_dir)
+        raise
+    _remove_job_dir(job_dir)
+    return token
+
+
+def _resolve_download(token: str) -> tuple[Path, str, Path]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        raise HTTPException(status_code=404, detail="Download link not found or expired")
+
+    download_dir = TMP_ROOT / f"download-{token}"
+    try:
+        if time.time() - download_dir.stat().st_mtime > DOWNLOAD_LINK_TTL_SECONDS:
+            _remove_job_dir(download_dir)
+            raise HTTPException(status_code=404, detail="Download link not found or expired")
+        output_files = [path for path in download_dir.iterdir() if path.is_file()]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Download link not found or expired") from exc
+
+    if len(output_files) != 1:
+        _remove_job_dir(download_dir)
+        raise HTTPException(status_code=404, detail="Download link not found or expired")
+
+    output_path = output_files[0]
+    extension = output_path.suffix.lower().lstrip(".")
+    media_type = "application/pdf" if extension == "pdf" else mimetypes.guess_type(output_path.name)[0]
+    if extension in MEDIA_PROFILES:
+        media_type = str(MEDIA_PROFILES[extension]["media_type"])
+    return output_path, media_type or "application/octet-stream", download_dir
 
 
 def _save_upload(upload: UploadFile, destination: Path) -> int:
@@ -261,8 +318,9 @@ def _file_response(output_path: Path, media_type: str, download_name: str, job_d
     )
 
 
-def _handle_failure(job_dir: Path, exc: Exception) -> None:
-    _remove_job_dir(job_dir)
+def _handle_failure(job_dir: Path | None, exc: Exception) -> None:
+    if job_dir is not None:
+        _remove_job_dir(job_dir)
     if isinstance(exc, UploadTooLarge):
         raise HTTPException(status_code=413, detail="Uploaded file is too large") from exc
     if isinstance(exc, ValueError):
@@ -280,10 +338,29 @@ def _cors_origins() -> list[str]:
     return [item.strip() for item in configured.split(",") if item.strip()]
 
 
+async def _cleanup_downloads_periodically() -> None:
+    interval = min(300, max(30, DOWNLOAD_LINK_TTL_SECONDS // 2))
+    while True:
+        await asyncio.sleep(interval)
+        _cleanup_expired_downloads()
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    cleanup_task = asyncio.create_task(_cleanup_downloads_periodically())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
+
+
 app = FastAPI(
     title="WeChat Converter API",
     version=SERVICE_VERSION,
     description="Document and media conversion service for a WeChat mini program.",
+    lifespan=_lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -319,55 +396,39 @@ def test_endpoint() -> dict[str, object]:
     }
 
 
-@app.post("/api/v1/convert/document-to-pdf")
-def document_to_pdf(file: UploadFile = File(...)) -> FileResponse:
+@app.post("/api/v1/convert/document-to-pdf", response_model=None)
+def document_to_pdf(
+    file: UploadFile = File(...),
+    response_mode: str = Form("file", description="Use 'link' for mini-program uploads"),
+) -> FileResponse | JSONResponse:
     extension = _extension(file.filename)
     if extension not in DOCUMENT_EXTENSIONS:
         raise HTTPException(
             status_code=415,
             detail=f"Unsupported document type. Allowed: {', '.join(sorted(DOCUMENT_EXTENSIONS))}",
         )
+    if response_mode not in {"file", "link"}:
+        raise HTTPException(status_code=400, detail="response_mode must be 'file' or 'link'")
     if not conversion_slots.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Too many conversions in progress")
 
-    job_dir = _new_job_dir()
+    job_dir: Path | None = None
     try:
+        job_dir = _new_job_dir()
         input_path = job_dir / f"input.{extension}"
         _save_upload(file, input_path)
         output_path, media_type = _convert_document(job_dir, input_path)
-        return _file_response(output_path, media_type, f"{_safe_stem(file.filename)}.pdf", job_dir)
-    except (UploadTooLarge, ConversionFailed, ValueError) as exc:
-        _handle_failure(job_dir, exc)
-        raise AssertionError("unreachable")
-    except Exception as exc:
-        _handle_failure(job_dir, exc)
-        raise AssertionError("unreachable")
-    finally:
-        file.file.close()
-        conversion_slots.release()
-
-
-@app.post("/api/v1/convert/media")
-def media_convert(
-    file: UploadFile = File(...),
-    target_format: str = Form(..., description="Target format, for example mp3 or mp4"),
-) -> FileResponse:
-    target = target_format.lower().strip().lstrip(".")
-    if target not in MEDIA_PROFILES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported target format. Allowed: {', '.join(sorted(MEDIA_PROFILES))}",
-        )
-    if not conversion_slots.acquire(blocking=False):
-        raise HTTPException(status_code=429, detail="Too many conversions in progress")
-
-    job_dir = _new_job_dir()
-    try:
-        input_extension = _extension(file.filename) or "input"
-        input_path = job_dir / f"input.{input_extension}"
-        _save_upload(file, input_path)
-        output_path, media_type = _convert_media(job_dir, input_path, target)
-        download_name = f"{_safe_stem(file.filename)}.{target}"
+        download_name = f"{_safe_stem(file.filename)}.pdf"
+        if response_mode == "link":
+            token = _store_download(output_path, job_dir, download_name)
+            return JSONResponse(
+                {
+                    "download_url": f"/api/v1/download/{token}",
+                    "filename": download_name,
+                    "media_type": media_type,
+                    "expires_in": DOWNLOAD_LINK_TTL_SECONDS,
+                }
+            )
         return _file_response(output_path, media_type, download_name, job_dir)
     except (UploadTooLarge, ConversionFailed, ValueError) as exc:
         _handle_failure(job_dir, exc)
@@ -378,6 +439,64 @@ def media_convert(
     finally:
         file.file.close()
         conversion_slots.release()
+
+
+@app.post("/api/v1/convert/media", response_model=None)
+def media_convert(
+    file: UploadFile = File(...),
+    target_format: str = Form(..., description="Target format, for example mp3 or mp4"),
+    response_mode: str = Form("file", description="Use 'link' for mini-program uploads"),
+) -> FileResponse | JSONResponse:
+    target = target_format.lower().strip().lstrip(".")
+    if target not in MEDIA_PROFILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported target format. Allowed: {', '.join(sorted(MEDIA_PROFILES))}",
+        )
+    if response_mode not in {"file", "link"}:
+        raise HTTPException(status_code=400, detail="response_mode must be 'file' or 'link'")
+    if not conversion_slots.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Too many conversions in progress")
+
+    job_dir: Path | None = None
+    try:
+        job_dir = _new_job_dir()
+        input_extension = _extension(file.filename) or "input"
+        input_path = job_dir / f"input.{input_extension}"
+        _save_upload(file, input_path)
+        output_path, media_type = _convert_media(job_dir, input_path, target)
+        download_name = f"{_safe_stem(file.filename)}.{target}"
+        if response_mode == "link":
+            token = _store_download(output_path, job_dir, download_name)
+            return JSONResponse(
+                {
+                    "download_url": f"/api/v1/download/{token}",
+                    "filename": download_name,
+                    "media_type": media_type,
+                    "expires_in": DOWNLOAD_LINK_TTL_SECONDS,
+                }
+            )
+        return _file_response(output_path, media_type, download_name, job_dir)
+    except (UploadTooLarge, ConversionFailed, ValueError) as exc:
+        _handle_failure(job_dir, exc)
+        raise AssertionError("unreachable")
+    except Exception as exc:
+        _handle_failure(job_dir, exc)
+        raise AssertionError("unreachable")
+    finally:
+        file.file.close()
+        conversion_slots.release()
+
+
+@app.get("/api/v1/download/{token}")
+def download_converted_file(token: str) -> FileResponse:
+    output_path, media_type, download_dir = _resolve_download(token)
+    return FileResponse(
+        output_path,
+        media_type=media_type,
+        filename=output_path.name,
+        background=BackgroundTask(_remove_job_dir, download_dir),
+    )
 
 
 @app.get("/")

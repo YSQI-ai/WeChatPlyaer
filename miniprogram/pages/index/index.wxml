@@ -1,0 +1,67 @@
+<view class="page-shell">
+  <view class="topline">
+    <view class="brand-mark">W</view>
+    <text class="brand-name">WECHAT CONVERTER</text>
+  </view>
+
+  <view class="heading-row">
+    <view>
+      <text class="eyebrow">文件工具</text>
+      <view class="page-title">文件转换</view>
+    </view>
+    <view class="status-indicator"><view class="status-dot"></view><text>{{apiConfigured ? '接口已配置' : '待配置'}}</text></view>
+  </view>
+
+  <view class="mode-switch">
+    <view class="mode-option {{mode === 'document' ? 'selected' : ''}}" data-mode="document" bindtap="chooseMode">文档转 PDF</view>
+    <view class="mode-option {{mode === 'media' ? 'selected' : ''}}" data-mode="media" bindtap="chooseMode">音视频转码</view>
+  </view>
+
+  <view class="form-section">
+    <view class="section-heading"><text>源文件</text><text class="section-index">01</text></view>
+    <view wx:if="{{!file}}" class="file-picker" bindtap="chooseFile">
+      <view class="picker-symbol">+</view>
+      <view class="picker-copy"><text class="picker-title">选择文件</text><text class="picker-subtitle">从微信聊天文件中选择</text></view>
+      <text class="picker-arrow">›</text>
+    </view>
+    <view wx:else class="selected-file">
+      <view class="file-type">{{mode === 'document' ? 'DOC' : 'MEDIA'}}</view>
+      <view class="file-details"><text class="file-name">{{file.name}}</text><text class="file-size">{{file.sizeText}}</text></view>
+      <button class="remove-file" bindtap="clearFile" aria-label="移除文件">×</button>
+    </view>
+  </view>
+
+  <view wx:if="{{mode === 'media'}}" class="form-section format-section">
+    <view class="section-heading"><text>目标格式</text><text class="section-index">02</text></view>
+    <picker mode="selector" range="{{formats}}" value="{{targetIndex}}" bindchange="changeFormat">
+      <view class="format-picker"><text>{{formats[targetIndex]}}</text><text class="picker-arrow">⌄</text></view>
+    </picker>
+  </view>
+
+  <view wx:if="{{uploading}}" class="progress-area">
+    <view class="progress-label"><text>正在上传并转换</text><text>{{progress}}%</text></view>
+    <progress percent="{{progress}}" stroke-width="4" activeColor="#23765a" backgroundColor="#dfe6df" />
+    <button class="cancel-button" bindtap="cancelUpload">取消</button>
+  </view>
+
+  <button wx:if="{{!uploading}}" class="primary-button" bindtap="startConversion" disabled="{{!file}}">开始转换 <text>→</text></button>
+
+  <view wx:if="{{result}}" class="result-section">
+    <view class="result-rule"></view>
+    <view class="section-heading"><text>转换完成</text><text class="success-label">READY</text></view>
+    <view class="result-file"><view class="result-check">✓</view><view class="file-details"><text class="file-name">{{result.filename}}</text><text class="file-size">下载链接有效 {{result.expiresText}}</text></view></view>
+    <button wx:if="{{!resultTempPath}}" class="secondary-button" bindtap="downloadResult">下载结果 <text>↓</text></button>
+    <block wx:else>
+      <view wx:if="{{resultKind === 'pdf'}}" class="result-actions">
+        <button class="secondary-button" bindtap="openResult">打开 PDF <text>↗</text></button>
+        <button class="save-button" bindtap="saveResult">保存文件</button>
+      </view>
+      <video wx:elif="{{resultKind === 'video'}}" class="media-preview" src="{{resultTempPath}}" controls show-fullscreen-btn></video>
+      <audio wx:else class="audio-preview" src="{{resultTempPath}}" controls></audio>
+      <button class="save-button save-after-download" bindtap="saveResult">保存到小程序文件</button>
+      <text wx:if="{{savedPath}}" class="saved-note">文件已保存</text>
+    </block>
+  </view>
+
+  <view wx:if="{{!apiConfigured}}" class="config-notice">配置 API 域名后即可开始</view>
+</view>
