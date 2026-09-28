@@ -37,7 +37,7 @@ Page({
     resultKind: '',
     resultTempPath: '',
     savedPath: '',
-    apiConfigured: /^https:\/\/[^/]+$/.test(API_ORIGIN) && !API_ORIGIN.includes('YOUR_API_DOMAIN')
+    apiConfigured: /^https?:\/\/[^/]+$/.test(API_ORIGIN) && !API_ORIGIN.includes('YOUR_API_DOMAIN')
   },
 
   chooseMode(event) {
